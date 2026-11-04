@@ -222,8 +222,9 @@ PY
 
 # Generate two per-node Host paths below fixed server-side prefixes.
 # The Config Profile remains identical across all nodes: /relay/ and /cache/.
-# NOTE: Shared profile (inbound extra) and Host xhttpExtraParams must BOTH use the same placement.
-# Real Xray field names are sessionPlacement/sessionKey/seqPlacement/seqKey (NOT sessionIDPlacement/sessionIDKey).
+# NOTE: Do NOT set sessionPlacement/sessionKey/seqPlacement/seqKey (nor the old sessionIDPlacement/sessionIDKey).
+# Nginx rewrites the per-node Host path to the shared /relay/ or /cache/ base, so the default (path) placement works
+# on the server and on every client core.
 read_manifest_path() {
   local key="$1"
   [[ -f "$STATE_DIR/manifest.env" ]] || return 0
@@ -453,11 +454,16 @@ chmod 644 "$SITE_DIR/index.html" "$SITE_DIR/404.html"
 log 'Writing Cloudflare CIDR allowlist and shared-prefix XHTTP reverse proxy locations'
 printf '%s\n' "$CF_ALLOW_TXT" > "$CFACL"
 chmod 644 "$CFACL"
+# The client uses the secret per-node path (node_path), while Xray listens on the shared base path (prefix).
+# With the default (path) session placement Xray reads the session id from the FIRST path segment after its base
+# path, so the per-node path must be rewritten to the base before proxying. This works with every client core
+# and needs no sessionPlacement/seqPlacement options.
 write_xhttp_location() {
-  local prefix="$1" port="$2" file="$3"
+  local node_path="$1" prefix="$2" port="$3" file="$4"
   cat > "$file" <<EOF
-location ^~ ${prefix} {
+location ^~ ${node_path} {
     include ${CFACL};
+    rewrite ^${node_path}(.*) ${prefix}\$1 break;
     client_max_body_size 0;
     client_body_buffer_size 2m;
     grpc_buffer_size 64k;
@@ -474,8 +480,8 @@ location ^~ ${prefix} {
 EOF
   chmod 644 "$file"
 }
-write_xhttp_location "$XHTTP_PREFIX" "$XHTTP_PORT" "$CDN_SNIP"
-write_xhttp_location "$XHTTP_WARP_PREFIX" "$XHTTP_WARP_PORT" "$WARP_SNIP"
+write_xhttp_location "$XHTTP_PATH" "$XHTTP_PREFIX" "$XHTTP_PORT" "$CDN_SNIP"
+write_xhttp_location "$XHTTP_WARP_PATH" "$XHTTP_WARP_PREFIX" "$XHTTP_WARP_PORT" "$WARP_SNIP"
 
 log 'Configuring TLS certificate and website'
 rm -f /etc/nginx/sites-enabled/default
@@ -853,11 +859,7 @@ extra={
     'noGRPCHeader':False,
     'xPaddingBytes':'100-1000',
     'scMaxEachPostBytes':1000000,
-    'scStreamUpServerSecs':'20-80',
-    'sessionPlacement':'query',
-    'sessionKey':'x_session',
-    'seqPlacement':'query',
-    'seqKey':'x_seq'
+    'scStreamUpServerSecs':'20-80'
 }
 base={
     'address':domain,
@@ -927,7 +929,7 @@ nginx -t >/dev/null 2>&1 || die 'nginx -t failed'
 curl_code() {
   curl -sS --resolve "${DOMAIN}:443:127.0.0.1" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' "https://${DOMAIN}$1" 2>/dev/null || printf 000
 }
-SITE_CODE=$(curl_code /); ACL1=$(curl_code "$XHTTP_PREFIX"); ACL2=$(curl_code "$XHTTP_WARP_PREFIX")
+SITE_CODE=$(curl_code /); ACL1=$(curl_code "$XHTTP_PATH"); ACL2=$(curl_code "$XHTTP_WARP_PATH")
 EXTRA_JSON=$(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["hosts"][0]["xhttpExtraParams"],separators=(",",":")))' "$STATE_DIR/host-settings.json")
 
 if [[ "$CF_REFRESH" == 1 ]]; then
@@ -947,6 +949,6 @@ printf '  Port 443 · TLS · ALPN h2 · Fingerprint chrome\n'
 printf '  Inbounds: VLESS_XHTTP_CDN (CDN) · VLESS_XHTTP_CDN_WARP (CDN+WARP)\n'
 printf '  XHTTP Extra: %s\n\n' "$EXTRA_JSON"
 if [[ "$SITE_CODE" != 200 || "$ACL1" != 403 || "$ACL2" != 403 ]]; then
-  warn "Self-check: site=$SITE_CODE /relay/=$ACL1 /cache/=$ACL2 (expected 200/403/403)"
+  warn "Self-check: site=$SITE_CODE cdn-path=$ACL1 warp-path=$ACL2 (expected 200/403/403)"
 fi
 printf 'Saved: %s/host-settings.txt   Backup: %s\n' "$STATE_DIR" "$BACKUP_DIR"
